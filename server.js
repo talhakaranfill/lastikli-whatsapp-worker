@@ -1,27 +1,33 @@
 /**
- * Lastikli Çarşaf — WhatsApp notification worker
+ * Lastikli Çarşaf — WhatsApp notification worker (Baileys)
  *
- * Architecture:
- *   PHP backend (lastiklicarsaf.tr) → HTTP POST → bu Node.js worker → WhatsApp Web (whatsapp-web.js)
+ * No Chromium / puppeteer — bağlanmak için direkt WhatsApp Web protokolü kullanır.
+ * Termux/Android ve ARM Linux'ta sorunsuz çalışır.
  *
  * QR auth (ilk çalıştırma):
- *   pm2 logs lastikli-whatsapp-worker → terminal QR çıkar → WhatsApp uygulamasından "Bağlı Cihazlar → Cihaz Bağla"
+ *   - Terminal'de QR kod çıkar → WhatsApp uygulamasından ⋮ → Bağlı Cihazlar → Cihaz Bağla
+ *   - Session ./session/ klasörüne kaydedilir, bir daha QR gerekmez
  *
  * Endpoints:
- *   GET  /status                       → bağlantı durumu (auth, ready)
- *   POST /notify/order-received        → yeni sipariş onay mesajı
- *   POST /notify/cargo-shipped         → kargo takip no mesajı
- *   POST /notify/delivery-tomorrow     → "yarın teslim" hatırlatma
- *   POST /notify/delivered             → teslim sonrası teşekkür
+ *   GET  /status                    → bağlantı durumu
+ *   POST /notify/order-received     → yeni sipariş onay mesajı
+ *   POST /notify/cargo-shipped      → kargo takip no mesajı
+ *   POST /notify/delivery-tomorrow  → yarın teslim hatırlatma
+ *   POST /notify/delivered          → teslim sonrası teşekkür
+ *   POST /notify/raw                → manuel mesaj (test)
  *
  * Auth: tüm POST endpoint'leri X-Worker-Secret header'ında WORKER_SECRET gerekir.
  */
 
 import 'dotenv/config';
 import express from 'express';
+import pino from 'pino';
 import qrcode from 'qrcode-terminal';
-import pkg from 'whatsapp-web.js';
-const { Client, LocalAuth } = pkg;
+import makeWASocket, {
+  useMultiFileAuthState,
+  DisconnectReason,
+  Browsers,
+} from '@whiskeysockets/baileys';
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const SECRET = process.env.WORKER_SECRET || '';
@@ -33,16 +39,9 @@ if (!SECRET || SECRET === 'change-me-to-something-random-and-long') {
   process.exit(1);
 }
 
-/* ─── Logger ─── */
-const LEVELS = { error: 0, warn: 1, info: 2, debug: 3 };
-const log = (level, ...args) => {
-  if (LEVELS[level] <= LEVELS[LOG_LEVEL]) {
-    const ts = new Date().toISOString();
-    console.log(`[${ts}] [${level.toUpperCase()}]`, ...args);
-  }
-};
+const logger = pino({ level: LOG_LEVEL });
 
-/* ─── Optional Telegram alerter (worker hatalarını admin'e bildirir) ─── */
+/* ─── Optional Telegram alerter ─── */
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const TG_CHAT  = process.env.TELEGRAM_CHAT_ID || '';
 const alertAdmin = async (msg) => {
@@ -56,89 +55,104 @@ const alertAdmin = async (msg) => {
   } catch { /* swallow */ }
 };
 
-/* ─── WhatsApp Client ─── */
+/* ─── WhatsApp State ─── */
+let sock = null;
 let waReady = false;
-let waAuthState = 'initializing'; // initializing | qr | authenticated | ready | disconnected
+let waState = 'initializing'; // initializing | qr | connecting | open | close
 
-const client = new Client({
-  authStrategy: new LocalAuth({ dataPath: SESSION_PATH }),
-  puppeteer: {
-    headless: true,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-accelerated-2d-canvas',
-      '--no-first-run',
-      '--no-zygote',
-      '--disable-gpu',
-    ],
-  },
-});
+async function startSocket() {
+  const { state, saveCreds } = await useMultiFileAuthState(SESSION_PATH);
 
-client.on('qr', (qr) => {
-  waAuthState = 'qr';
-  log('info', '📱 QR kod oluşturuldu. WhatsApp uygulamasından tara:');
-  qrcode.generate(qr, { small: true });
-  log('info', '   WhatsApp → ⋮ → Bağlı Cihazlar → Cihaz Bağla');
-});
+  sock = makeWASocket({
+    auth: state,
+    logger: logger.child({ module: 'baileys' }),
+    printQRInTerminal: false, // kendi QR'ımızı bastırıyoruz
+    browser: Browsers.appropriate('Lastikli Çarşaf Worker'),
+    // Daha temiz log için:
+    syncFullHistory: false,
+    markOnlineOnConnect: false, // kullanıcının "online" status'unu bozmaz
+  });
 
-client.on('authenticated', () => {
-  waAuthState = 'authenticated';
-  log('info', '✅ WhatsApp authentication başarılı.');
-});
+  sock.ev.on('creds.update', saveCreds);
 
-client.on('auth_failure', (msg) => {
-  waAuthState = 'disconnected';
-  log('error', '❌ WhatsApp auth başarısız:', msg);
-  alertAdmin(`Auth failure: ${msg}`);
-});
+  sock.ev.on('connection.update', (update) => {
+    const { connection, lastDisconnect, qr } = update;
 
-client.on('ready', () => {
-  waReady = true;
-  waAuthState = 'ready';
-  log('info', '🚀 WhatsApp Web hazır — mesaj atmaya başlayabiliriz.');
-  alertAdmin('Worker hazır, WhatsApp bağlı.');
-});
+    if (qr) {
+      waState = 'qr';
+      logger.info('📱 QR kod oluşturuldu. WhatsApp uygulamasından tara:');
+      qrcode.generate(qr, { small: true });
+      console.log('\n   WhatsApp → ⋮ → Bağlı Cihazlar → Cihaz Bağla\n');
+    }
 
-client.on('disconnected', (reason) => {
-  waReady = false;
-  waAuthState = 'disconnected';
-  log('warn', '⚠️ WhatsApp bağlantısı koptu:', reason);
-  alertAdmin(`Disconnected: ${reason} — yeniden başlatmaya çalışıyor.`);
-  // pm2 restart yapsın diye process'i çıkar
-  setTimeout(() => process.exit(1), 2000);
-});
+    if (connection === 'connecting') {
+      waState = 'connecting';
+      logger.info('🔄 Bağlanıyor...');
+    }
 
-log('info', '🔄 WhatsApp client başlatılıyor...');
-client.initialize().catch(err => {
-  log('error', 'Initialize hatası:', err.message);
+    if (connection === 'open') {
+      waReady = true;
+      waState = 'open';
+      logger.info(`🚀 WhatsApp bağlandı — ${sock.user?.id || 'unknown'}`);
+      alertAdmin(`Worker hazır, WhatsApp bağlı. (${sock.user?.id || 'no id'})`);
+    }
+
+    if (connection === 'close') {
+      waReady = false;
+      waState = 'close';
+      const code = lastDisconnect?.error?.output?.statusCode;
+      const shouldReconnect = code !== DisconnectReason.loggedOut;
+      logger.warn({ code, shouldReconnect }, '⚠️ Bağlantı koptu');
+
+      if (shouldReconnect) {
+        // Reconnect — pm2'ye gerek yok, içeride deneriz
+        setTimeout(() => {
+          logger.info('🔄 Yeniden bağlanıyor...');
+          startSocket().catch(err => {
+            logger.error({ err }, 'Reconnect başarısız, exit ediliyor (pm2 restart edecek)');
+            alertAdmin(`Reconnect failed: ${err.message}`);
+            process.exit(1);
+          });
+        }, 3000);
+      } else {
+        // Logged out — session geçersiz, manuel müdahale gerek
+        logger.error('🚫 Hesap logout edildi. Session sil ve QR yeniden tara.');
+        alertAdmin('Logout edildi — session silip QR yeniden tarayın.');
+        process.exit(1);
+      }
+    }
+  });
+}
+
+logger.info('🔄 WhatsApp socket başlatılıyor...');
+startSocket().catch(err => {
+  logger.error({ err }, 'Initialize hatası');
   alertAdmin(`Initialize error: ${err.message}`);
   process.exit(1);
 });
 
 /* ─── Phone helpers ─── */
 /**
- * Türk telefon numarasını WhatsApp ID formatına çevir.
- * "0555..." / "+90555..." / "555..." → "905551234567@c.us"
+ * Türk telefon numarasını WhatsApp JID formatına çevir.
+ * "0555..." / "+90555..." / "555..." → "905551234567@s.whatsapp.net"
  */
-const toWhatsAppId = (phone) => {
+const toWhatsAppJid = (phone) => {
   if (!phone) return null;
   const digits = String(phone).replace(/\D/g, '');
   let normalized;
   if (digits.length === 11 && digits.startsWith('0')) {
-    normalized = '90' + digits.substring(1);          // 0555... → 90555...
+    normalized = '90' + digits.substring(1);
   } else if (digits.length === 10 && digits.startsWith('5')) {
-    normalized = '90' + digits;                       // 555... → 90555...
+    normalized = '90' + digits;
   } else if (digits.length === 12 && digits.startsWith('90')) {
-    normalized = digits;                              // 90555... → kullan
+    normalized = digits;
   } else if (digits.length === 13 && digits.startsWith('900')) {
-    normalized = '90' + digits.substring(3);          // hatalı 0090555... → 90555...
+    normalized = '90' + digits.substring(3);
   } else {
     return null;
   }
-  if (!/^905\d{9}$/.test(normalized)) return null;    // 90 + 5 + 9 digit
-  return `${normalized}@c.us`;
+  if (!/^905\d{9}$/.test(normalized)) return null;
+  return `${normalized}@s.whatsapp.net`;
 };
 
 /* ─── Message templates ─── */
@@ -212,113 +226,99 @@ const tmpl = {
   },
 };
 
+/* ─── Send helper ─── */
+const sendMessage = async (phone, text) => {
+  if (!waReady || !sock) {
+    return { ok: false, error: 'WhatsApp henüz hazır değil', state: waState };
+  }
+  const jid = toWhatsAppJid(phone);
+  if (!jid) {
+    return { ok: false, error: 'Geçersiz telefon formatı: ' + phone };
+  }
+  try {
+    // Telefon WhatsApp'a kayıtlı mı kontrol et (Baileys onWhatsApp)
+    const exists = await sock.onWhatsApp(jid.split('@')[0]);
+    if (!exists || !exists[0]?.exists) {
+      return { ok: false, error: 'Bu numara WhatsApp\'a kayıtlı değil: ' + phone };
+    }
+    const result = await sock.sendMessage(jid, { text });
+    logger.info({ to: phone, msgId: result.key.id }, '✉️  Mesaj gönderildi');
+    return { ok: true, messageId: result.key.id };
+  } catch (err) {
+    logger.error({ to: phone, err: err.message }, 'Send failed');
+    return { ok: false, error: err.message };
+  }
+};
+
 /* ─── Express API ─── */
 const app = express();
 app.use(express.json({ limit: '100kb' }));
 
-// Auth middleware
 const requireSecret = (req, res, next) => {
   const got = req.header('X-Worker-Secret') || '';
   if (got !== SECRET) {
-    log('warn', `Yetkisiz istek: ${req.path} from ${req.ip}`);
+    logger.warn({ path: req.path, ip: req.ip }, 'Yetkisiz istek');
     return res.status(401).json({ ok: false, error: 'Unauthorized' });
   }
   next();
 };
 
-// Send helper
-const sendMessage = async (phone, text) => {
-  if (!waReady) {
-    return { ok: false, error: 'WhatsApp henüz hazır değil', state: waAuthState };
-  }
-  const id = toWhatsAppId(phone);
-  if (!id) {
-    return { ok: false, error: 'Geçersiz telefon formatı: ' + phone };
-  }
-  try {
-    // Telefon WhatsApp'a kayıtlı mı kontrol et
-    const numberId = await client.getNumberId(id.replace('@c.us', ''));
-    if (!numberId) {
-      return { ok: false, error: 'Bu numara WhatsApp\'a kayıtlı değil: ' + phone };
-    }
-    const msg = await client.sendMessage(numberId._serialized, text);
-    log('info', `✉️  Sent to ${phone} (${id}): ${msg.id._serialized}`);
-    return { ok: true, messageId: msg.id._serialized };
-  } catch (err) {
-    log('error', `Send failed to ${phone}:`, err.message);
-    return { ok: false, error: err.message };
-  }
-};
-
-/* ─── Routes ─── */
 app.get('/status', (req, res) => {
   res.json({
     ok: true,
-    state: waAuthState,
+    state: waState,
     ready: waReady,
+    user: sock?.user?.id || null,
     uptime: process.uptime(),
-    version: '1.0.0',
+    version: '2.0.0',
+    engine: 'baileys',
   });
 });
 
 app.post('/notify/order-received', requireSecret, async (req, res) => {
   const { phone, customerName, orderNo, total, sizes } = req.body || {};
-  if (!phone || !orderNo) {
-    return res.status(400).json({ ok: false, error: 'phone ve orderNo gerekli' });
-  }
-  const text = tmpl.orderReceived({ customerName, orderNo, total, sizes });
-  const result = await sendMessage(phone, text);
+  if (!phone || !orderNo) return res.status(400).json({ ok: false, error: 'phone ve orderNo gerekli' });
+  const result = await sendMessage(phone, tmpl.orderReceived({ customerName, orderNo, total, sizes }));
   res.status(result.ok ? 200 : 500).json(result);
 });
 
 app.post('/notify/cargo-shipped', requireSecret, async (req, res) => {
   const { phone, customerName, orderNo, trackingNumber, trackingUrl } = req.body || {};
-  if (!phone || !orderNo || !trackingNumber) {
-    return res.status(400).json({ ok: false, error: 'phone, orderNo, trackingNumber gerekli' });
-  }
-  const text = tmpl.cargoShipped({ customerName, orderNo, trackingNumber, trackingUrl });
-  const result = await sendMessage(phone, text);
+  if (!phone || !orderNo || !trackingNumber) return res.status(400).json({ ok: false, error: 'phone, orderNo, trackingNumber gerekli' });
+  const result = await sendMessage(phone, tmpl.cargoShipped({ customerName, orderNo, trackingNumber, trackingUrl }));
   res.status(result.ok ? 200 : 500).json(result);
 });
 
 app.post('/notify/delivery-tomorrow', requireSecret, async (req, res) => {
   const { phone, customerName, orderNo, trackingNumber } = req.body || {};
-  if (!phone || !orderNo) {
-    return res.status(400).json({ ok: false, error: 'phone ve orderNo gerekli' });
-  }
-  const text = tmpl.deliveryTomorrow({ customerName, orderNo, trackingNumber });
-  const result = await sendMessage(phone, text);
+  if (!phone || !orderNo) return res.status(400).json({ ok: false, error: 'phone ve orderNo gerekli' });
+  const result = await sendMessage(phone, tmpl.deliveryTomorrow({ customerName, orderNo, trackingNumber }));
   res.status(result.ok ? 200 : 500).json(result);
 });
 
 app.post('/notify/delivered', requireSecret, async (req, res) => {
   const { phone, customerName, orderNo } = req.body || {};
-  if (!phone || !orderNo) {
-    return res.status(400).json({ ok: false, error: 'phone ve orderNo gerekli' });
-  }
-  const text = tmpl.delivered({ customerName, orderNo });
-  const result = await sendMessage(phone, text);
+  if (!phone || !orderNo) return res.status(400).json({ ok: false, error: 'phone ve orderNo gerekli' });
+  const result = await sendMessage(phone, tmpl.delivered({ customerName, orderNo }));
   res.status(result.ok ? 200 : 500).json(result);
 });
 
-// Generic raw send — testing & ad-hoc usage
 app.post('/notify/raw', requireSecret, async (req, res) => {
   const { phone, message } = req.body || {};
-  if (!phone || !message) {
-    return res.status(400).json({ ok: false, error: 'phone ve message gerekli' });
-  }
+  if (!phone || !message) return res.status(400).json({ ok: false, error: 'phone ve message gerekli' });
   const result = await sendMessage(phone, message);
   res.status(result.ok ? 200 : 500).json(result);
 });
 
 app.listen(PORT, '0.0.0.0', () => {
-  log('info', `🌐 HTTP listening on :${PORT}`);
+  logger.info(`🌐 HTTP listening on :${PORT}`);
 });
 
 // Graceful shutdown
-const shutdown = () => {
-  log('info', '👋 Kapatılıyor...');
-  client.destroy().finally(() => process.exit(0));
+const shutdown = async () => {
+  logger.info('👋 Kapatılıyor...');
+  try { await sock?.end(undefined); } catch { /* ignore */ }
+  process.exit(0);
 };
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
