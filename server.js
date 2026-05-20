@@ -34,6 +34,8 @@ const PORT = parseInt(process.env.PORT || '3000', 10);
 const SECRET = process.env.WORKER_SECRET || '';
 const SESSION_PATH = process.env.SESSION_PATH || './session';
 const LOG_LEVEL = (process.env.LOG_LEVEL || 'info').toLowerCase();
+const BACKEND_URL = (process.env.BACKEND_URL || '').replace(/\/$/, '');
+const POLL_INTERVAL = Math.max(2, parseInt(process.env.POLL_INTERVAL || '5', 10)) * 1000;
 
 if (!SECRET || SECRET === 'change-me-to-something-random-and-long') {
   console.error('❌ WORKER_SECRET set edilmedi veya default — .env dosyasını düzelt.');
@@ -322,6 +324,91 @@ app.post('/notify/raw', requireSecret, async (req, res) => {
 app.listen(PORT, '0.0.0.0', () => {
   logger.info(`🌐 HTTP listening on :${PORT}`);
 });
+
+/* ─── Backend Polling Client ───────────────────────────────────────────
+ * PHP backend'in wa_queue tablosundan pending mesajları çeker, gönderir,
+ * ack'lar. Outbound HTTP — Termux'tan inbound açma gerekmez.
+ * ────────────────────────────────────────────────────────────────────── */
+const buildMessage = (type, payload) => {
+  switch (type) {
+    case 'order-received':    return tmpl.orderReceived(payload);
+    case 'cargo-shipped':     return tmpl.cargoShipped(payload);
+    case 'delivery-tomorrow': return tmpl.deliveryTomorrow(payload);
+    case 'delivered':         return tmpl.delivered(payload);
+    case 'raw':               return payload.message || '';
+    default: return null;
+  }
+};
+
+async function pollOnce() {
+  if (!BACKEND_URL || !waReady) return; // backend yapılandırılmamış veya WA hazır değil
+
+  try {
+    const res = await fetch(`${BACKEND_URL}/wa-queue?action=pending&limit=10`, {
+      headers: { 'X-Worker-Secret': SECRET },
+      // Termux fetch için timeout
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!res.ok) {
+      logger.warn({ status: res.status }, 'Pending fetch HTTP error');
+      return;
+    }
+    const data = await res.json();
+    if (!data.ok || !Array.isArray(data.items) || data.items.length === 0) return;
+
+    logger.info({ count: data.items.length }, '📥 Pending mesaj alındı');
+
+    for (const item of data.items) {
+      const text = buildMessage(item.type, { ...item.payload, orderNo: item.orderNo });
+      if (!text) {
+        await ackBackend(item.id, 'failed', '', `Bilinmeyen type: ${item.type}`);
+        continue;
+      }
+
+      const result = await sendMessage(item.phone, text);
+      if (result.ok) {
+        await ackBackend(item.id, 'sent', result.messageId || '', '');
+        logger.info({ id: item.id, phone: item.phone, type: item.type }, '✅ Gönderildi + ack');
+      } else {
+        await ackBackend(item.id, 'failed', '', result.error || 'unknown error');
+        logger.warn({ id: item.id, phone: item.phone, error: result.error }, '❌ Gönderim başarısız');
+      }
+
+      // Rate limit guard — peş peşe mesaj atma, 1-2 sn ara ver
+      await new Promise(r => setTimeout(r, 1500));
+    }
+  } catch (err) {
+    // Network hatası — gelecek tick'te tekrar dener, log'da spam yapma
+    if (!err.message?.includes('aborted')) {
+      logger.debug({ err: err.message }, 'Poll error (will retry)');
+    }
+  }
+}
+
+async function ackBackend(id, status, messageId, error) {
+  try {
+    await fetch(`${BACKEND_URL}/wa-queue?action=ack`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Worker-Secret': SECRET },
+      body: JSON.stringify({ id, status, messageId, error }),
+      signal: AbortSignal.timeout(10000),
+    });
+  } catch (err) {
+    logger.warn({ id, err: err.message }, 'Ack hatası (queue tekrar dener)');
+  }
+}
+
+// Poll loop başlat
+if (BACKEND_URL) {
+  logger.info({ backend: BACKEND_URL, interval: POLL_INTERVAL / 1000 + 's' }, '🔄 Polling client başlıyor');
+  // İlk poll'u 10 sn geciktir (WhatsApp bağlantı için bekle)
+  setTimeout(() => {
+    pollOnce();
+    setInterval(pollOnce, POLL_INTERVAL);
+  }, 10000);
+} else {
+  logger.warn('⚠️  BACKEND_URL set edilmedi — polling devre dışı (.env dosyasına ekle)');
+}
 
 // Graceful shutdown
 const shutdown = async () => {
