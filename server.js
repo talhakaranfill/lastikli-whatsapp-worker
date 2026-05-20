@@ -20,6 +20,7 @@
  */
 
 import 'dotenv/config';
+import crypto from 'crypto';
 import express from 'express';
 import pino from 'pino';
 import qrcode from 'qrcode-terminal';
@@ -156,6 +157,15 @@ const toWhatsAppJid = (phone) => {
 };
 
 /* ─── Message templates ─── */
+// Her mesajda benzersiz ref kodu — bot algılamasını zorlaştırır (aynı içerik gitmesin diye)
+const generateRef = (orderNo) => {
+  const salt = crypto.randomBytes(3).toString('hex').toUpperCase();
+  return orderNo ? `${orderNo}-${salt}` : salt;
+};
+
+const footer = (orderNo) =>
+  `\n\n─────────────\nℹ️ Bu otomatik bir bildirimdir, yanıtlamanıza gerek yoktur.\nRef: ${generateRef(orderNo)}`;
+
 const tmpl = {
   orderReceived: ({ customerName, orderNo, total, sizes }) => {
     const first = (customerName || '').split(' ')[0] || 'değerli müşterimiz';
@@ -169,10 +179,9 @@ const tmpl = {
       `📋 *Sipariş No:* ${orderNo}${sizeText}${totalText}`,
       ``,
       `Hazırlığı bitince kargoya verip takip numarasıyla size yazacağız.`,
-      `Sorularınız için bu numaradan ulaşabilirsiniz.`,
       ``,
       `Teşekkürler 🙏`,
-    ].join('\n');
+    ].join('\n') + footer(orderNo);
   },
 
   cargoShipped: ({ customerName, orderNo, trackingNumber, trackingUrl }) => {
@@ -189,7 +198,7 @@ const tmpl = {
       `1-3 iş günü içinde kapınızda olacak. Kapıda nakit veya kart ile ödeyebilirsiniz.`,
       ``,
       `Lastikli Çarşaf 🛏️`,
-    ].join('\n');
+    ].join('\n') + footer(orderNo);
   },
 
   deliveryTomorrow: ({ customerName, orderNo, trackingNumber }) => {
@@ -205,7 +214,7 @@ const tmpl = {
       `Kapıda nakit veya kart ile ödeme alacak. Lütfen telefonunuzun açık olmasına dikkat edin.`,
       ``,
       `Lastikli Çarşaf 🛏️`,
-    ].join('\n');
+    ].join('\n') + footer(orderNo);
   },
 
   delivered: ({ customerName, orderNo }) => {
@@ -222,7 +231,7 @@ const tmpl = {
       ``,
       `Yeniden görüşmek üzere 🙏`,
       `*Lastikli Çarşaf*`,
-    ].join('\n');
+    ].join('\n') + footer(orderNo);
   },
 };
 
