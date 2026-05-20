@@ -321,8 +321,17 @@ app.post('/notify/raw', requireSecret, async (req, res) => {
   res.status(result.ok ? 200 : 500).json(result);
 });
 
-app.listen(PORT, '0.0.0.0', () => {
+// HTTP server opsiyonel — polling outbound, inbound gerekmez.
+// EADDRINUSE olursa crash etme, log + devam et.
+const httpServer = app.listen(PORT, '0.0.0.0', () => {
   logger.info(`🌐 HTTP listening on :${PORT}`);
+});
+httpServer.on('error', (err) => {
+  if (err.code === 'EADDRINUSE') {
+    logger.warn(`⚠️  Port ${PORT} kullanımda — HTTP server atlanıyor, polling devam eder`);
+  } else {
+    logger.error({ err: err.message }, 'HTTP server error');
+  }
 });
 
 /* ─── Backend Polling Client ───────────────────────────────────────────
