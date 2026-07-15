@@ -24,6 +24,8 @@ import crypto from 'crypto';
 import express from 'express';
 import pino from 'pino';
 import qrcode from 'qrcode-terminal';
+import QRCode from 'qrcode';
+import { rm } from 'fs/promises';
 import makeWASocket, {
   useMultiFileAuthState,
   DisconnectReason,
@@ -62,6 +64,9 @@ const alertAdmin = async (msg) => {
 let sock = null;
 let waReady = false;
 let waState = 'initializing'; // initializing | qr | connecting | open | close
+let lastQrDataUrl = null;     // panel için QR (PNG data URL) — sadece state='qr' iken dolu
+let connectedAt = null;       // bağlantı zamanı (open)
+let lastError = null;         // son kopma sebebi (panele bilgi)
 
 async function startSocket() {
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_PATH);
@@ -78,14 +83,18 @@ async function startSocket() {
 
   sock.ev.on('creds.update', saveCreds);
 
-  sock.ev.on('connection.update', (update) => {
+  sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
       waState = 'qr';
+      waReady = false;
       logger.info('📱 QR kod oluşturuldu. WhatsApp uygulamasından tara:');
       qrcode.generate(qr, { small: true });
       console.log('\n   WhatsApp → ⋮ → Bağlı Cihazlar → Cihaz Bağla\n');
+      // Panel için QR'ı PNG data URL olarak sakla (terminale erişmeden okutulur)
+      try { lastQrDataUrl = await QRCode.toDataURL(qr, { margin: 1, width: 320 }); }
+      catch (e) { lastQrDataUrl = null; }
     }
 
     if (connection === 'connecting') {
@@ -96,6 +105,9 @@ async function startSocket() {
     if (connection === 'open') {
       waReady = true;
       waState = 'open';
+      lastQrDataUrl = null; // bağlandı → QR artık geçersiz
+      lastError = null;
+      connectedAt = Date.now();
       logger.info(`🚀 WhatsApp bağlandı — ${sock.user?.id || 'unknown'}`);
       alertAdmin(`Worker hazır, WhatsApp bağlı. (${sock.user?.id || 'no id'})`);
     }
@@ -105,6 +117,7 @@ async function startSocket() {
       waState = 'close';
       const code = lastDisconnect?.error?.output?.statusCode;
       const shouldReconnect = code !== DisconnectReason.loggedOut;
+      lastError = code === DisconnectReason.loggedOut ? 'logged_out' : (lastDisconnect?.error?.message || 'connection_closed');
       logger.warn({ code, shouldReconnect }, '⚠️ Bağlantı koptu');
 
       if (shouldReconnect) {
@@ -281,9 +294,43 @@ app.get('/status', (req, res) => {
     ready: waReady,
     user: sock?.user?.id || null,
     uptime: process.uptime(),
-    version: '2.0.0',
+    version: '2.1.0',
     engine: 'baileys',
   });
+});
+
+/* ─── Session yönetimi (panel entegrasyonu — secret korumalı) ─── */
+// Tam durum + QR (PNG data URL) + bağlı numara. Panel bu endpoint'i poll eder (site API proxy'si üzerinden).
+app.get('/session', requireSecret, (req, res) => {
+  const id = sock?.user?.id || '';
+  const number = id ? id.split(':')[0].split('@')[0] : null;
+  res.json({
+    ok: true,
+    state: waState,                                   // initializing | qr | connecting | open | close
+    ready: waReady,
+    qr: waState === 'qr' ? lastQrDataUrl : null,       // PNG data URL — sadece QR beklerken
+    me: id ? { id, number, name: sock?.user?.name || sock?.user?.verifiedName || null } : null,
+    connectedAt,
+    lastError,
+    uptime: process.uptime(),
+    version: '2.1.0',
+  });
+});
+
+// Yeniden bağlan (kopan bağlantıyı toparla — numarayı DEĞİŞTİRMEZ, session korunur).
+app.post('/session/reconnect', requireSecret, (req, res) => {
+  logger.info('🔄 Panel: manuel reconnect istendi');
+  res.json({ ok: true, message: 'Yeniden bağlanılıyor…' });
+  try { sock?.end(new Error('manual-reconnect')); } catch (e) { /* close handler auto-reconnect eder */ }
+});
+
+// Çıkış yap / yeni numara bağla — session temizlenir, worker restart olur → yeni QR.
+app.post('/session/logout', requireSecret, async (req, res) => {
+  logger.info('🚪 Panel: logout / yeni QR istendi');
+  res.json({ ok: true, message: 'Oturum kapatılıyor, yeni QR hazırlanıyor…' });
+  try { await sock?.logout?.(); } catch (e) { /* best-effort unlink */ }
+  try { await rm(SESSION_PATH, { recursive: true, force: true }); } catch (e) { /* creds temizle */ }
+  setTimeout(() => process.exit(0), 400); // pm2 autorestart → temiz session → yeni QR
 });
 
 app.post('/notify/order-received', requireSecret, async (req, res) => {
